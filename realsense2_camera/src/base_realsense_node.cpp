@@ -84,7 +84,8 @@ BaseRealSenseNode::BaseRealSenseNode(ros::NodeHandle& nodeHandle,
     _pnh(privateNodeHandle), _dev(dev), _json_file_path(""),
     _serial_no(serial_no),
     _is_initialized_time_base(false),
-    _namespace(getNamespaceStr())
+    _namespace(getNamespaceStr()),
+    _colorizer_setup(false)
 {
     // Types for depth stream
     _image_format[RS2_STREAM_DEPTH] = CV_16UC1;    // CVBridge type
@@ -448,8 +449,7 @@ void BaseRealSenseNode::registerDynamicOption(ros::NodeHandle& nh, rs2::options 
             {
                 auto option_value = bool(sensor.get_option(option));
                 if (nh1.param(option_name, option_value, option_value))
-                {
-                    sensor.set_option(option, option_value);
+                { sensor.set_option(option, option_value);
                 }
                 ddynrec->registerVariable<bool>(
                 option_name, option_value,
@@ -582,6 +582,25 @@ void BaseRealSenseNode::registerDynamicReconfigCb(ros::NodeHandle& nh)
         ROS_DEBUG_STREAM("module_name:" << module_name);
         registerDynamicOption(nh, sensor, module_name);
     }
+
+    // adding clipping_distance dynamic_reconfigure param
+    ros::NodeHandle nh1(nh, "clipping_distance");
+    std::shared_ptr<ddynamic_reconfigure::DDynamicReconfigure> ddynrec = std::make_shared<ddynamic_reconfigure::DDynamicReconfigure>(nh1);
+    ddynrec->registerVariable<double>(
+        "clipping_distance", _clipping_distance, [this](double new_value){this->_clipping_distance = new_value;},
+        "maximum distance from camera", 0.0, 100.0);
+    ddynrec->publishServicesTopics();
+    _ddynrec.push_back(ddynrec);
+
+    // adding filters dynamic_reconfigure param
+    ros::NodeHandle nh2(nh, "filters");
+    std::shared_ptr<ddynamic_reconfigure::DDynamicReconfigure> ddynrec2 = std::make_shared<ddynamic_reconfigure::DDynamicReconfigure>(nh2);
+    ddynrec2->registerVariable<std::string>(
+        "filters", _filters_str, [this](std::string new_value){this->_filters_str = new_value;},
+        "filters");
+    ddynrec2->publishServicesTopics();
+    _ddynrec.push_back(ddynrec2);
+
     ROS_INFO("Done Setting Dynamic reconfig parameters.");
 }
 
@@ -959,12 +978,21 @@ void BaseRealSenseNode::publishAlignedDepthToOthers(rs2::frameset frames, const 
             rs2::frameset processed = frames.apply_filter(*align);
             std::vector<rs2::frame> frames_to_publish;
             frames_to_publish.push_back(processed.get_depth_frame());   // push_back(aligned_depth_frame)
-            for (std::vector<NamedFilter>::const_iterator filter_it = _filters.begin(); filter_it != _filters.end(); filter_it++)
+
+            if (_filters_str.find("colorizer") != std::string::npos)
             {
-                if (filter_it->_name == "colorizer")
+                for (std::vector<NamedFilter>::const_iterator filter_it = _filters.begin(); filter_it != _filters.end(); filter_it++)
                 {
-                    frames_to_publish.push_back(filter_it->_filter->process(frames_to_publish.back()));  //push_back(colorized)
-                    break;
+                    if (filter_it->_name == "colorizer")
+                    {
+                        if (!_colorizer_setup) {
+                            ROS_WARN("Colorizer filter must be added to `filters` parameter during launch. Ignoring.");
+                        }
+                        else {
+                            frames_to_publish.push_back(filter_it->_filter->process(frames_to_publish.back()));  //push_back(colorized)
+                        }
+                        break;
+                    }
                 }
             }
 
@@ -1077,67 +1105,18 @@ void BaseRealSenseNode::enable_devices()
 
 void BaseRealSenseNode::setupFilters()
 {
-    std::vector<std::string> filters_str;
-    boost::split(filters_str, _filters_str, [](char c){return c == ',';});
-    bool use_disparity_filter(false);
-    bool use_colorizer_filter(false);
-    bool use_decimation_filter(false);
-    for (std::vector<std::string>::const_iterator s_iter=filters_str.begin(); s_iter!=filters_str.end(); s_iter++)
-    {
-        if ((*s_iter) == "colorizer")
-        {
-            use_colorizer_filter = true;
-        }
-        else if ((*s_iter) == "disparity")
-        {
-            use_disparity_filter = true;
-        }
-        else if ((*s_iter) == "spatial")
-        {
-            ROS_INFO("Add Filter: spatial");
-            _filters.push_back(NamedFilter("spatial", std::make_shared<rs2::spatial_filter>()));
-        }
-        else if ((*s_iter) == "temporal")
-        {
-            ROS_INFO("Add Filter: temporal");
-            _filters.push_back(NamedFilter("temporal", std::make_shared<rs2::temporal_filter>()));
-        }
-        else if ((*s_iter) == "hole_filling")
-        {
-            ROS_INFO("Add Filter: hole_filling");
-            _filters.push_back(NamedFilter("hole_filling", std::make_shared<rs2::hole_filling_filter>()));
-        }
-        else if ((*s_iter) == "decimation")
-        {
-            use_decimation_filter = true;
-        }
-        else if ((*s_iter) == "pointcloud")
-        {
-            assert(_pointcloud); // For now, it is set in getParameters()..
-        }
-        else if ((*s_iter).size() > 0)
-        {
-            ROS_ERROR_STREAM("Unknown Filter: " << (*s_iter));
-            throw;
-        }
-    }
-    if (use_disparity_filter)
-    {
-        ROS_INFO("Add Filter: disparity");
-        _filters.insert(_filters.begin(), NamedFilter("disparity_start", std::make_shared<rs2::disparity_transform>()));
-        _filters.push_back(NamedFilter("disparity_end", std::make_shared<rs2::disparity_transform>(false)));
-        ROS_INFO("Done Add Filter: disparity");
-    }
-    if (use_decimation_filter)
-    {
-      ROS_INFO("Add Filter: decimation");
-      _filters.insert(_filters.begin(),NamedFilter("decimation", std::make_shared<rs2::decimation_filter>()));
-    }
-    if (use_colorizer_filter)
+    _filters.push_back(NamedFilter("spatial", std::make_shared<rs2::spatial_filter>()));
+    _filters.push_back(NamedFilter("temporal", std::make_shared<rs2::temporal_filter>()));
+    _filters.push_back(NamedFilter("hole_filling", std::make_shared<rs2::hole_filling_filter>()));
+    _filters.insert(_filters.begin(), NamedFilter("disparity_start", std::make_shared<rs2::disparity_transform>()));
+    _filters.push_back(NamedFilter("disparity_end", std::make_shared<rs2::disparity_transform>(false)));
+    _filters.insert(_filters.begin(),NamedFilter("decimation", std::make_shared<rs2::decimation_filter>()));
+    _filters.push_back(NamedFilter("colorizer", std::make_shared<rs2::colorizer>()));
+    _filters.push_back(NamedFilter("pointcloud", std::make_shared<rs2::pointcloud>(_pointcloud_texture.first, _pointcloud_texture.second)));
+
+    if (_filters_str.find("colorizer") != std::string::npos)
     {
         ROS_INFO("Add Filter: colorizer");
-        _filters.push_back(NamedFilter("colorizer", std::make_shared<rs2::colorizer>()));
-
         // Types for depth stream
         _image_format[DEPTH.first] = _image_format[COLOR.first];    // CVBridge type
         _encoding[DEPTH.first] = _encoding[COLOR.first]; // ROS message type
@@ -1149,13 +1128,8 @@ void BaseRealSenseNode::setupFilters()
         _width[DEPTH] = _width[COLOR];
         _height[DEPTH] = _height[COLOR];
         _image[DEPTH] = cv::Mat(_height[DEPTH], _width[DEPTH], _image_format[DEPTH.first], cv::Scalar(0, 0, 0));
+        _colorizer_setup = true;
     }
-    if (_pointcloud)
-    {
-    	ROS_INFO("Add Filter: pointcloud");
-        _filters.push_back(NamedFilter("pointcloud", std::make_shared<rs2::pointcloud>(_pointcloud_texture.first, _pointcloud_texture.second)));
-    }
-    ROS_INFO("num_filters: %d", static_cast<int>(_filters.size()));
 }
 
 cv::Mat& BaseRealSenseNode::fix_depth_scale(const cv::Mat& from_image, cv::Mat& to_image)
@@ -1558,12 +1532,19 @@ void BaseRealSenseNode::frame_callback(rs2::frame frame)
             {
                 clip_depth(depth_frame, _clipping_distance);
             }
-
-            ROS_DEBUG("num_filters: %d", static_cast<int>(_filters.size()));
             for (std::vector<NamedFilter>::const_iterator filter_it = _filters.begin(); filter_it != _filters.end(); filter_it++)
             {
-                ROS_DEBUG("Applying filter: %s", filter_it->_name.c_str());
-                frameset = filter_it->_filter->process(frameset);
+                if (_filters_str.find(filter_it->_name) != std::string::npos)
+                {
+                    if (filter_it->_name == "colorizer" && !_colorizer_setup) {
+                        ROS_WARN("Colorizer filter must be added to `filters` parameter during launch. Ignoring colorizer.");
+                    }
+                    else {
+                        ROS_DEBUG("Applying filter: %s", filter_it->_name.c_str());
+                        ROS_ERROR("Applying filter: %s", filter_it->_name.c_str());
+                        frameset = filter_it->_filter->process(frameset);
+                    }
+                }
             }
 
             ROS_DEBUG("List of frameset after applying filters: size: %d", static_cast<int>(frameset.size()));
