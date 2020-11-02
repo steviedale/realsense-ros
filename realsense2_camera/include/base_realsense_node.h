@@ -156,6 +156,7 @@ namespace realsense2_camera
         ros::NodeHandle& _node_handle, _pnh;
         bool _align_depth;
         std::vector<rs2_option> _monitor_options;
+        bool _colorizer_setup;
 
         virtual void calcAndPublishStaticTransform(const stream_index_pair& stream, const rs2::stream_profile& base_profile);
         rs2::stream_profile getAProfile(const stream_index_pair& stream);
